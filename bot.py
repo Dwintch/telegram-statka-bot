@@ -6,7 +6,7 @@ from collections import defaultdict, Counter
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, Update
+from aiogram.types import Message
 from aiogram.enums.parse_mode import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
@@ -23,7 +23,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID"))
 TOPIC_ID = int(os.getenv("TOPIC_ID"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-project.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Например: https://your-project.onrender.com/webhook
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -112,7 +112,7 @@ async def extract_with_openai(text: str):
 async def handle_topic_message(message: Message):
     user_id = message.from_user.id
     recent_user_msgs[user_id].append(message.text or "")
-    context_text = " ".join(recent_user_msgs[user_id][-3:])  # последние 3 сообщения пользователя
+    context_text = " ".join(recent_user_msgs[user_id][-3:])  # последние 3 сообщения от пользователя
     print(f"📩 Контекст: {context_text}")
 
     parsed = extract_data(context_text)
@@ -133,8 +133,9 @@ async def handle_topic_message(message: Message):
 async def send_statka(message: Message):
     await message.reply(await format_stat())
 
-@router.message(F.is_topic_message & (F.chat.id == GROUP_CHAT_ID) & F.text.startswith("/топик"))
+@router.message(F.is_topic_message & (F.chat.id == GROUP_CHAT_ID) & F.text == "/топик")
 async def send_topic_id(message: Message):
+    print(f"Получена команда /топик в топике {message.message_thread_id}")
     topic_id = message.message_thread_id
     await message.reply(f"ID этого топика: <code>{topic_id}</code>")
 
