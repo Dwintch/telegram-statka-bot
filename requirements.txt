@@ -1,4 +1,5 @@
 aiogram
 apscheduler
 python-dotenv
+openai
 
