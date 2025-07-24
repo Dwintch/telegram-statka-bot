@@ -5,12 +5,14 @@ import json
 from collections import defaultdict, Counter
 from datetime import datetime
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import Message, Update
 from aiogram.enums.parse_mode import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
-from aiogram.utils.markdown import hbold
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import openai
@@ -21,24 +23,25 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID"))
 TOPIC_ID = int(os.getenv("TOPIC_ID"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-project.onrender.com/webhook
+
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Инициализация
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
+router = Router()
 
 # Хранилище статистики
 stats = defaultdict(lambda: Counter())
+recent_user_msgs = defaultdict(list)  # user_id -> [messages]
 
-# Магазины и ключи
 SHOP_NAMES = ["хайп", "янтарь", "полка"]
 KEYWORDS = ["мало", "нету", "нет", "закончился", "закончились", "не осталось"]
 
-# Цветовая маркировка
 STATE_COLORS = {
-    "мало": "\u26A0\ufe0f",   # ⚠️ жёлтый
-    "нету": "\u274C",          # ❌ красный
+    "мало": "\u26A0\ufe0f",
+    "нету": "\u274C",
     "нет": "\u274C",
     "закончился": "\u274C",
     "закончились": "\u274C",
@@ -61,7 +64,6 @@ def extract_data(text: str):
         if shop in text.lower():
             found_shop = shop
             break
-
     if not found_shop:
         return None
 
@@ -98,26 +100,24 @@ async def extract_with_openai(text: str):
         )
         raw = response.choices[0].message.content.strip()
         parsed = json.loads(raw)
-
         shop = parsed.get("shop")
         items = parsed.get("items", [])
-
         if shop and items:
             return shop, [(normalize_state(state), name) for state, name in items]
-        else:
-            return None
     except Exception as e:
         print(f"❌ OpenAI error: {e}")
-        return None
+    return None
 
-@dp.message(F.is_topic_message & (F.chat.id == GROUP_CHAT_ID) & (F.message_thread_id == TOPIC_ID))
+@router.message(F.is_topic_message & (F.chat.id == GROUP_CHAT_ID) & (F.message_thread_id == TOPIC_ID))
 async def handle_topic_message(message: Message):
-    text = message.text
-    print(f"📩 Сообщение: {text}")
+    user_id = message.from_user.id
+    recent_user_msgs[user_id].append(message.text or "")
+    context_text = " ".join(recent_user_msgs[user_id][-3:])  # последние 3
+    print(f"📩 Контекст: {context_text}")
 
-    parsed = extract_data(text)
+    parsed = extract_data(context_text)
     if not parsed:
-        parsed = await extract_with_openai(text)
+        parsed = await extract_with_openai(context_text)
         print(f"🤖 OpenAI дал: {parsed}")
 
     if not parsed:
@@ -129,7 +129,7 @@ async def handle_topic_message(message: Message):
         stats[shop][(name, state)] += 1
     print(f"✅ Статка обновлена: {shop} -> {items}")
 
-@dp.message(F.text.startswith("/статка"))
+@router.message(F.text.startswith("/статка"))
 async def send_statka(message: Message):
     await message.reply(await format_stat())
 
@@ -140,7 +140,6 @@ def format_item(name, state, count):
 async def format_stat():
     if not stats:
         return "Пока нет данных."
-
     lines = [f"📊 <b>Актуальная статка</b> на {datetime.now().strftime('%d.%m %H:%M')}\n"]
     for shop, items in stats.items():
         lines.append(f"<u>{shop.capitalize()}</u>:")
@@ -157,10 +156,18 @@ async def send_daily_stat():
     text = await format_stat()
     await bot.send_message(chat_id=GROUP_CHAT_ID, message_thread_id=TOPIC_ID, text=text)
 
+async def on_startup(bot: Bot):
+    await bot.set_webhook(WEBHOOK_URL)
+    print("🔗 Webhook установлен")
+
 async def main():
+    dp.include_router(router)
     setup_scheduler()
-    await dp.start_polling(bot)
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
+    setup_application(app, dp, bot=bot)
+    return app
 
 if __name__ == "__main__":
-    print("Бот запущен...")
-    asyncio.run(main())
+    print("🚀 Запуск веб-сервиса...")
+    web.run_app(main())
