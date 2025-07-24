@@ -44,7 +44,7 @@ def extract_data(text: str):
         if shop in text.lower():
             found_shop = shop
             break
-    
+
     if not found_shop:
         return None
 
@@ -58,8 +58,8 @@ def extract_data(text: str):
 
     return found_shop, results
 
-@dp.message(F.chat.id == GROUP_CHAT_ID)
-async def handle_message(message: Message):
+@dp.message(F.is_topic_message & (F.chat.id == GROUP_CHAT_ID) & (F.message_thread_id == TOPIC_ID))
+async def handle_topic_message(message: Message):
     parsed = extract_data(message.text)
     if not parsed:
         return
@@ -80,7 +80,7 @@ def format_item(name, state, count):
 async def format_stat():
     if not stats:
         return "Пока нет данных."
-    
+
     lines = [f"\uD83D\uDCCA <b>Актуальная статка</b> на {datetime.now().strftime('%d.%m %H:%M')}\n"]
     for shop, items in stats.items():
         lines.append(f"<u>{shop.capitalize()}</u>:")
@@ -104,5 +104,3 @@ async def main():
 if __name__ == "__main__":
     print("Бот запущен...")
     asyncio.run(main())
-
-
