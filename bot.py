@@ -27,13 +27,27 @@ stats = defaultdict(lambda: Counter())
 
 # Магазины и ключи
 SHOP_NAMES = ["хайп", "янтарь", "полка"]
-KEYWORDS = ["мало", "нету"]
+KEYWORDS = ["мало", "нету", "нет", "закончился", "закончились", "не осталось"]
 
 # Цветовая маркировка
 STATE_COLORS = {
     "мало": "\u26A0\ufe0f",   # ⚠️ жёлтый
-    "нету": "\u274C"          # ❌ красный
+    "нету": "\u274C",          # ❌ красный
+    "нет": "\u274C",
+    "закончился": "\u274C",
+    "закончились": "\u274C",
+    "не осталось": "\u274C"
 }
+
+SYNONYMS = {
+    "нет": "нету",
+    "не осталось": "нету",
+    "закончился": "нету",
+    "закончились": "нету"
+}
+
+def normalize_state(state):
+    return SYNONYMS.get(state, state)
 
 def extract_data(text: str):
     """
@@ -50,11 +64,18 @@ def extract_data(text: str):
 
     results = []
     for keyword in KEYWORDS:
-        if keyword in text.lower():
-            pattern = rf"{keyword} ([\w\s\-\d\+]+)"
-            matches = re.findall(pattern, text.lower())
-            for item in matches:
-                results.append((keyword, item.strip()))
+        pattern = rf"{keyword}\s+([\w\s\-\d\+]+)"
+        matches = re.findall(pattern, text.lower())
+        for item in matches:
+            norm = normalize_state(keyword)
+            results.append((norm, item.strip()))
+
+        # Поддержка формата: "спрайт нету", "пиво мало"
+        pattern2 = rf"([\w\s\-\d\+]+)\s+{keyword}"
+        matches2 = re.findall(pattern2, text.lower())
+        for item in matches2:
+            norm = normalize_state(keyword)
+            results.append((norm, item.strip()))
 
     return found_shop, results
 
