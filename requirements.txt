@@ -2,4 +2,5 @@ aiogram
 apscheduler
 python-dotenv
 openai
-
+apscheduler 
+aiohttp
