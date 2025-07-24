@@ -1,19 +1,21 @@
+import asyncio
 import os
 import re
-import asyncio
-from collections import defaultdict, deque, Counter
-from datetime import datetime
+from collections import defaultdict, Counter, deque
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InputFile
+from aiogram.types import Message
 from aiogram.enums.parse_mode import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import openai
+from dotenv import load_dotenv
 
-# Загрузка переменных окружения
+load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID"))
 TOPIC_ID = int(os.getenv("TOPIC_ID"))
@@ -21,140 +23,192 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 openai.api_key = OPENAI_API_KEY
 
-# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
 
-# Константы
+# Константы и переменные
 SHOP_NAMES = ["хайп", "янтарь", "полка"]
-STATE_SYNONYMS = {
+KEYWORDS = ["мало", "нету", "нет", "закончился", "закончились", "не осталось"]
+
+STATE_COLORS = {
+    "мало": "⚠️",   # желтый
+    "нету": "❌",   # красный
+    "нет": "❌",
+    "закончился": "❌",
+    "закончились": "❌",
+    "не осталось": "❌"
+}
+
+SYNONYMS = {
     "нет": "нету",
     "не осталось": "нету",
     "закончился": "нету",
     "закончились": "нету"
 }
-KEYWORDS = list(STATE_SYNONYMS.keys()) + ["мало", "нету"]
-
-STATE_COLORS = {
-    "мало": "\u26A0\ufe0f",   # ⚠️ жёлтый
-    "нету": "\u274C",          # ❌ красный
-}
-
-USER_CONTEXT_SIZE = 5
-
-# Храним последние сообщения (текст + фото) пользователя в топике
-user_messages = defaultdict(lambda: deque(maxlen=USER_CONTEXT_SIZE))
-
-# Храним статистику за каждый день: stats_by_day[date][shop][(name, state)] = count
-stats_by_day = defaultdict(lambda: defaultdict(Counter))
-
 
 def normalize_state(state):
-    return STATE_SYNONYMS.get(state, state)
+    return SYNONYMS.get(state, state)
 
+# Статистика: { магазин: Counter((товар, состояние) : count) }
+stats = defaultdict(Counter)
 
-def parse_ai_response(text: str):
+# Для анализа сообщений: { user_id: deque[(message_id, text, datetime)] }
+user_message_history = defaultdict(lambda: deque(maxlen=10))
+
+def extract_data(text: str):
     """
-    Пример простой обработки ответа ИИ.
-    Предполагаем, что ИИ вернёт список строк:
-    Магазин: хайп
-    - мало: лабубу энерджи
-    - нету: стичи
-    ...
-    Возвращаем (shop, [(state, name), ...])
+    Извлекает магазин, товары и их состояние (мало/нету) из текста.
+    Возвращает (shop, [(state, item), ...]) или None.
     """
-    result = []
-    current_shop = None
-    lines = text.lower().split("\n")
-    for line in lines:
-        line = line.strip()
-        if any(shop in line for shop in SHOP_NAMES):
-            # Найти магазин в строке
-            for shop in SHOP_NAMES:
-                if shop in line:
-                    current_shop = shop
-                    break
-        elif current_shop and line.startswith("-"):
-            # Формат "- мало: товар1, товар2"
-            m = re.match(r"-\s*(\w+):\s*(.+)", line)
-            if m:
-                state = normalize_state(m.group(1))
-                items = [item.strip() for item in re.split(r",| и |;", m.group(2))]
-                for item in items:
-                    if item:
-                        result.append((current_shop, (state, item)))
-    return result
+    text_lower = text.lower()
+    found_shop = None
+    for shop in SHOP_NAMES:
+        if shop in text_lower:
+            found_shop = shop
+            break
+    if not found_shop:
+        return None
 
+    results = []
+    # ищем конструкции "мало товар" или "товар мало"
+    for keyword in KEYWORDS:
+        norm_state = normalize_state(keyword)
+        # pattern "keyword item"
+        pattern1 = rf"{keyword}\s+([\w\s\-\d\+]+)"
+        matches1 = re.findall(pattern1, text_lower)
+        for item in matches1:
+            item = item.strip()
+            if item:
+                results.append((norm_state, item))
 
-async def ai_parse_messages(text: str):
-    prompt = f"""
-Ты — помощник для разбора сообщений в телеграм-группе магазина.
-Нужно из текста выделить магазин (из списка: хайп, янтарь, полка),
-товары и их состояние: мало, нету, закончился (все синонимы нормализовать к "мало" или "нету").
-Верни результат в формате (магазин, состояние, товар), по одному на строку, например:
-хайп мало лабубу энерджи
-янтарь нету стичи
+        # pattern "item keyword"
+        pattern2 = rf"([\w\s\-\d\+]+)\s+{keyword}"
+        matches2 = re.findall(pattern2, text_lower)
+        for item in matches2:
+            item = item.strip()
+            if item:
+                results.append((norm_state, item))
 
-Текст для анализа:
-{text}
-"""
+    if not results:
+        return None
+
+    return found_shop, results
+
+async def analyze_messages_with_openai(texts: list[str]) -> dict:
+    """
+    Использует OpenAI для анализа текста списка сообщений, чтобы понять товары и их состояния.
+    Возвращает структуру вида:
+    {
+        "shop": "хайп",
+        "items": [
+            {"state": "мало", "name": "лабубу энерджи"},
+            {"state": "нету", "name": "стичей"},
+            ...
+        ]
+    }
+    Если не удалось распарсить — возвращает None.
+    """
+    prompt = (
+        "Ты — помощник, который анализирует сообщения о наличии товаров в магазинах.\n"
+        "Магазины: хайп, янтарь, полка.\n"
+        "Товары могут быть в состоянии 'мало' или 'нету'.\n"
+        "Вот сообщения:\n"
+        + "\n".join(f"- {t}" for t in texts) +
+        "\n\nВыведи JSON с магазином и списком товаров с состояниями. "
+        "Пример:\n"
+        '{ "shop": "хайп", "items": [ {"state": "мало", "name": "лабубу энерджи"}, {"state": "нету", "name": "стичей"} ] }'
+    )
+
     try:
         response = await openai.ChatCompletion.acreate(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
             temperature=0
         )
-        answer = response.choices[0].message.content
-        return parse_ai_response(answer)
+        content = response.choices[0].message.content.strip()
+        import json
+        parsed = json.loads(content)
+        # базовая валидация
+        if "shop" in parsed and "items" in parsed:
+            return parsed
+        return None
     except Exception as e:
-        print(f"OpenAI error: {e}")
-        return []
+        print(f"OpenAI parsing error: {e}")
+        return None
 
-
-def extract_data(text: str):
+async def update_stats_from_user_messages(user_id: int):
     """
-    Быстрая локальная попытка парсинга (резерв)
+    Анализирует последние сообщения пользователя и обновляет глобальную статистику.
     """
-    found_shop = None
-    text = text.lower()
-    for shop in SHOP_NAMES:
-        if shop in text:
-            found_shop = shop
-            break
-    if not found_shop:
-        return []
+    messages = [msg for _, msg, dt in user_message_history[user_id] if (datetime.now() - dt).total_seconds() < 86400]
+    if not messages:
+        return
 
-    results = []
-    for keyword in KEYWORDS:
-        pattern = rf"{keyword}\s+([\w\s\-\d\+]+)"
-        matches = re.findall(pattern, text)
-        for item in matches:
-            norm = normalize_state(keyword)
-            results.append((found_shop, (norm, item.strip())))
+    parsed = await analyze_messages_with_openai(messages)
+    if not parsed:
+        return
 
-        pattern2 = rf"([\w\s\-\d\+]+)\s+{keyword}"
-        matches2 = re.findall(pattern2, text)
-        for item in matches2:
-            norm = normalize_state(keyword)
-            results.append((found_shop, (norm, item.strip())))
+    shop = parsed["shop"].lower()
+    if shop not in SHOP_NAMES:
+        return
 
-    return results
+    for item in parsed["items"]:
+        state = normalize_state(item.get("state", ""))
+        name = item.get("name", "").strip()
+        if state and name:
+            stats[shop][(name, state)] += 1
 
+@dp.message(F.is_topic_message & (F.chat.id == GROUP_CHAT_ID) & (F.message_thread_id == TOPIC_ID))
+async def handle_topic_message(message: Message):
+    # Добавляем в историю
+    user_id = message.from_user.id
+    user_message_history[user_id].append((message.message_id, message.text or "", datetime.now()))
+
+    # Обрабатываем базово для быстрого сбора
+    parsed = extract_data(message.text or "")
+    if parsed:
+        shop, items = parsed
+        for state, name in items:
+            stats[shop][(name, state)] += 1
+        print(f"[{shop.upper()}] {items}")
+
+    # Также запускаем расширенный анализ нескольких сообщений с ИИ (асинхронно)
+    asyncio.create_task(update_stats_from_user_messages(user_id))
+
+@dp.message(F.text.startswith("/статка"))
+async def send_statka(message: Message):
+    text = await format_stat()
+    await message.reply(text)
 
 def format_item(name, state, count):
     icon = STATE_COLORS.get(state, "")
     return f"{icon} <b>{name}</b> — {state} ({count})"
 
-
 async def format_stat():
-    if not stats_by_day:
+    if not stats:
         return "Пока нет данных."
 
-    lines = [f"\U0001F4CA <b>Актуальная статистика</b> на {datetime.now().strftime('%d.%m %H:%M')}\n"]
-    today = datetime.now().strftime("%d.%m.%Y")
-    for shop, items in stats_by_day[today].items():
+    lines = [f"📊 <b>Актуальная статка</b> на {datetime.now().strftime('%d.%m %H:%M')}\n"]
+    for shop, items in stats.items():
         lines.append(f"<u>{shop.capitalize()}</u>:")
         for (name, state), count in items.most_common():
-            lines.append(format_item(_
+            lines.append(format_item(name, state, count))
+        lines.append("")
+    return "\n".join(lines)
+
+async def send_daily_stat():
+    text = await format_stat()
+    await bot.send_message(chat_id=GROUP_CHAT_ID, message_thread_id=TOPIC_ID, text=text)
+
+def setup_scheduler():
+    scheduler.add_job(send_daily_stat, "cron", hour=0, minute=0)
+    scheduler.start()
+
+async def main():
+    setup_scheduler()
+    print("Бот запущен...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
